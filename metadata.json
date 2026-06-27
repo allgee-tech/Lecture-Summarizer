@@ -1,0 +1,6 @@
+{
+  "name": "Lecture Summarizer",
+  "description": "AI-powered lecture summarization and interactive study cards for university students.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
