@@ -17,8 +17,15 @@ import android.util.Log
 // --- Gemini API Models ---
 
 @JsonClass(generateAdapter = true)
+data class InlineData(
+    @Json(name = "mime_type") val mimeType: String,
+    @Json(name = "data") val data: String
+)
+
+@JsonClass(generateAdapter = true)
 data class Part(
-    @Json(name = "text") val text: String? = null
+    @Json(name = "text") val text: String? = null,
+    @Json(name = "inline_data") val inlineData: InlineData? = null
 )
 
 @JsonClass(generateAdapter = true)
@@ -82,6 +89,15 @@ data class LectureSummaryResult(
     @Json(name = "summaryDetailed") val summaryDetailed: String? = null
 )
 
+/**
+ * Outcome of an audio transcription request, so the UI can show actionable
+ * messages instead of silently failing.
+ */
+sealed interface TranscriptionResult {
+    data class Success(val text: String) : TranscriptionResult
+    data class Error(val message: String) : TranscriptionResult
+}
+
 // --- Retrofit API Service ---
 
 interface GeminiApiService {
@@ -95,6 +111,15 @@ interface GeminiApiService {
 object GeminiClient {
     private const val TAG = "GeminiClient"
     private const val BASE_URL = "https://generativelanguage.googleapis.com/"
+
+    /**
+     * The Gemini API caps a generateContent request (including inline data) at
+     * 20 MB; we stop well short of that to leave room for the prompt itself.
+     */
+    const val MAX_INLINE_AUDIO_BYTES = 18 * 1024 * 1024
+
+    /** Exact marker the transcription prompt asks the model to emit on silence. */
+    private const val NO_SPEECH_MARKER = "NO_SPEECH_DETECTED"
 
     private val moshi: Moshi = Moshi.Builder()
         .addLast(KotlinJsonAdapterFactory())
@@ -193,6 +218,78 @@ object GeminiClient {
         } catch (e: Exception) {
             Log.e(TAG, "Error calling Gemini API: ", e)
             null
+        }
+    }
+
+    /**
+     * Transcribes lecture audio by sending it inline to Gemini as base64
+     * `inline_data`. Supported types include audio/mp3, audio/mp4 (.m4a),
+     * audio/wav, audio/aac, audio/ogg, audio/flac.
+     *
+     * Audio larger than [maxBytes] is rejected up front because the API caps
+     * total request size at 20 MB.
+     */
+    suspend fun transcribeAudio(
+        mimeType: String,
+        audioBytes: ByteArray,
+        maxBytes: Int = MAX_INLINE_AUDIO_BYTES
+    ): TranscriptionResult {
+        if (audioBytes.isEmpty()) {
+            return TranscriptionResult.Error("The audio file is empty — nothing to transcribe.")
+        }
+        if (audioBytes.size > maxBytes) {
+            val mb = audioBytes.size / (1024 * 1024)
+            return TranscriptionResult.Error(
+                "Audio is too large for a single request ($mb MB > 20 MB API limit). " +
+                "Trim the clip to under ~30 minutes, or re-encode it at a lower bitrate."
+            )
+        }
+
+        val apiKey = BuildConfig.GEMINI_API_KEY
+        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
+            Log.e(TAG, "Gemini API key is missing or is placeholder for transcription!")
+            return TranscriptionResult.Error(
+                "Gemini API key is not configured. Add GEMINI_API_KEY to your .env file " +
+                "to transcribe real audio, or paste a transcript manually below."
+            )
+        }
+
+        val base64Audio = android.util.Base64.encodeToString(audioBytes, android.util.Base64.NO_WRAP)
+
+        val prompt = """
+            Transcribe this recording of a university lecture into written text, as accurately and verbatim as possible.
+            Output ONLY the spoken content as clean paragraphs of plain text.
+            Do not add speaker labels, timestamps, summaries, commentary, or markdown formatting.
+            If the audio contains no intelligible speech, reply with exactly: $NO_SPEECH_MARKER
+        """.trimIndent()
+
+        val request = GenerateContentRequest(
+            contents = listOf(
+                Content(
+                    parts = listOf(
+                        Part(text = prompt),
+                        Part(inlineData = InlineData(mimeType = mimeType, data = base64Audio))
+                    )
+                )
+            ),
+            generationConfig = GenerationConfig(temperature = 0.1)
+        )
+
+        return try {
+            val response = service.generateContent(apiKey, request)
+            val text = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text?.trim()
+            when {
+                text.isNullOrBlank() -> {
+                    Log.e(TAG, "Received empty transcript response from Gemini.")
+                    TranscriptionResult.Error("Gemini returned an empty transcript. Please try again.")
+                }
+                text.equals(NO_SPEECH_MARKER, ignoreCase = true) ->
+                    TranscriptionResult.Error("No intelligible speech was detected in this audio.")
+                else -> TranscriptionResult.Success(text)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error transcribing audio with Gemini API: ", e)
+            TranscriptionResult.Error("Transcription failed: ${e.localizedMessage ?: "network error"}")
         }
     }
 

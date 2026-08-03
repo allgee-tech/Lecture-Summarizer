@@ -1,16 +1,21 @@
 package com.example.ui
 
 import android.app.Application
+import android.media.MediaMetadataRetriever
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.data.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import android.util.Log
+import java.io.File
 
 sealed interface ScreenState {
     object Dashboard : ScreenState
@@ -20,7 +25,11 @@ sealed interface ScreenState {
 
 class LectureViewModel(
     application: Application,
-    private val repository: LectureRepository
+    private val repository: LectureRepository,
+    // Injectable so unit tests can substitute a fake microphone controller.
+    private val audioRecorderFactory: () -> AudioRecorderController = {
+        MediaRecorderController(application)
+    }
 ) : AndroidViewModel(application) {
 
     private val _currentScreen = MutableStateFlow<ScreenState>(ScreenState.Dashboard)
@@ -45,7 +54,7 @@ class LectureViewModel(
     var lectureTitle = MutableStateFlow("")
     var transcriptInput = MutableStateFlow("")
 
-    // Simulated recording states
+    // Recording states (real microphone capture via [AudioRecorderController])
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
 
@@ -92,6 +101,10 @@ class LectureViewModel(
 
     private val _uploadedFileName = MutableStateFlow<String?>(null)
     val uploadedFileName: StateFlow<String?> = _uploadedFileName.asStateFlow()
+
+    // Imported audio awaiting transcription (local app-storage copy + its MIME type)
+    private val pendingAudioFile = MutableStateFlow<File?>(null)
+    private val pendingAudioMimeType = MutableStateFlow<String?>(null)
 
     fun selectKeyword(keyword: String?, transcriptText: String = "") {
         if (keyword == null) {
@@ -163,6 +176,10 @@ class LectureViewModel(
 
     private var recordingJob: Job? = null
 
+    private companion object {
+        const val TAG = "LectureViewModel"
+    }
+
     init {
         // Seed default subjects if database is empty
         viewModelScope.launch {
@@ -182,8 +199,8 @@ class LectureViewModel(
         if (screen is ScreenState.LectureDetail) {
             loadLectureDetails(screen.lectureId)
         } else {
-            // Stop recording if navigating away
-            stopRecording()
+            // Discard any in-progress capture when navigating away
+            cancelRecording()
         }
     }
 
@@ -200,62 +217,96 @@ class LectureViewModel(
         }
     }
 
-    // --- Recording Simulation ---
+    // --- Microphone Recording (real capture) ---
 
+    private var activeRecorder: AudioRecorderController? = null
+    private var recordingFile: File? = null
+
+    /**
+     * Starts capturing microphone audio. The UI must obtain RECORD_AUDIO
+     * permission before calling this.
+     */
     fun startRecording() {
         if (_isRecording.value) return
+
+        val context = getApplication<Application>()
+        val file = File(
+            context.cacheDir,
+            "recording_${System.currentTimeMillis()}$RECORDED_AUDIO_FILE_EXTENSION"
+        )
+        val recorder = audioRecorderFactory()
+
+        try {
+            recorder.start(file)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start microphone recording", e)
+            file.delete()
+            _uiMessage.value = "Could not start microphone: ${e.localizedMessage ?: "unknown error"}"
+            return
+        }
+
+        activeRecorder = recorder
+        recordingFile = file
         _isRecording.value = true
         _recordingDuration.value = 0
         transcriptInput.value = ""
-        
-        val presets = listOf(
-            "Good morning class. Today we are exploring Artificial Neural Networks. " +
-            "Specifically, we will discuss how nodes, weights, and bias functions model human brain activity. " +
-            "A neuron receives numerical inputs, multiplies them by their corresponding connection weights, " +
-            "and sums them up. This sum is passed through an activation function, such as Sigmoid, ReLU, or Softmax. " +
-            "The activation function introduces non-linearity, which is critical because without it, " +
-            "the neural network would just behave like a single linear regression model, regardless of depth.",
-            
-            "Welcome back. In today's Macroeconomics session, we investigate the Law of Supply and Demand. " +
-            "At the equilibrium price, the quantity demanded by consumers exactly matches the quantity supplied " +
-            "by producers. If supply drops due to a resource shock, the supply curve shifts leftward, " +
-            "causing a market shortage, which pushes prices upward. Price elasticity of demand measures " +
-            "how responsive buyers are to price changes. Highly elastic products see sharp demand drops with small price hikes.",
-            
-            "Today we cover the Fall of the Roman Empire. Academic historians generally point to a combination " +
-            "of military decay, economic hyperinflation, political corruption, and pressure from barbarian migrations " +
-            "such as the Goths and Vandals around 476 CE. Emperor Diocletian partitioned the empire into the Western " +
-            "and Eastern sectors, which created administrative separation and ultimately accelerated the collapse of Rome."
-        )
 
-        val selectedPreset = presets.random()
-        val words = selectedPreset.split(" ")
-
+        // Tick real elapsed time while capturing.
         recordingJob = viewModelScope.launch {
-            var wordIndex = 0
             while (_isRecording.value) {
                 delay(1000)
                 _recordingDuration.value += 1
-                
-                // Gradually append words to simulate real-time typing transcript
-                val wordsToAdd = 4 + (1..3).random()
-                val endIndex = (wordIndex + wordsToAdd).coerceAtMost(words.size)
-                if (wordIndex < words.size) {
-                    val slice = words.subList(wordIndex, endIndex).joinToString(" ")
-                    transcriptInput.value = if (transcriptInput.value.isEmpty()) slice else "${transcriptInput.value} $slice"
-                    wordIndex = endIndex
-                } else {
-                    // Loop or stop
-                    stopRecording()
-                }
             }
         }
     }
 
+    /** Stops the capture and kicks off transcription of what was recorded. */
     fun stopRecording() {
+        if (!_isRecording.value && activeRecorder == null) return
         _isRecording.value = false
         recordingJob?.cancel()
         recordingJob = null
+
+        val recorder = activeRecorder
+        val file = recordingFile
+        activeRecorder = null
+        recordingFile = null
+
+        if (recorder == null || file == null) return
+
+        var failed = false
+        try {
+            recorder.stop()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to finalize recording", e)
+            failed = true
+        }
+        if (failed || !file.exists() || file.length() == 0L) {
+            file.delete()
+            _uiMessage.value = "Recording was too short — no audio was captured."
+            return
+        }
+
+        transcribeAudioFile(file, RECORDED_AUDIO_MIME_TYPE)
+    }
+
+    /** Aborts an in-progress capture and discards the partial audio. */
+    fun cancelRecording() {
+        if (activeRecorder == null && !_isRecording.value) return
+        _isRecording.value = false
+        recordingJob?.cancel()
+        recordingJob = null
+        activeRecorder?.cancel()
+        activeRecorder = null
+        recordingFile?.delete()
+        recordingFile = null
+        _recordingDuration.value = 0
+    }
+
+    /** Called by the UI when the user denies microphone access. */
+    fun onMicPermissionDenied() {
+        _uiMessage.value = "Microphone permission is required to record lectures. " +
+            "You can still import an audio file or paste a transcript below."
     }
 
     // --- Database Operations ---
@@ -516,52 +567,123 @@ class LectureViewModel(
         }
     }
 
-    // --- Audio File Upload / Transcription Action ---
+    // --- Audio File Import / Transcription Actions ---
 
-    fun setUploadedAudio(fileName: String) {
-        _uploadedFileName.value = fileName
-        _recordingDuration.value = (180..360).random() // random audio duration in seconds
-        
-        if (lectureTitle.value.isEmpty()) {
-            val cleanTitle = fileName.substringBeforeLast(".")
-                .replace("_", " ")
-                .replace("-", " ")
-                .split(" ")
-                .joinToString(" ") { it.replaceFirstChar { c -> c.uppercase() } }
-            lectureTitle.value = cleanTitle
+    /**
+     * Copies the user-picked audio into app storage (so we never depend on
+     * outliving the source Uri's read grant), probes its real duration, and
+     * stages it for transcription.
+     */
+    fun importAudio(uri: Uri, displayName: String) {
+        viewModelScope.launch {
+            _uiMessage.value = "Importing audio file..."
+            try {
+                val context = getApplication<Application>()
+                val cleanName = displayName.substringAfterLast('/')
+                    .ifBlank { "imported_audio" }
+                    .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                val local = withContext(Dispatchers.IO) {
+                    val dest = File(context.cacheDir, "import_${System.currentTimeMillis()}_$cleanName")
+                    val stream = context.contentResolver.openInputStream(uri)
+                        ?: throw java.io.IOException("The selected file could not be opened")
+                    stream.use { input -> dest.outputStream().use { output -> input.copyTo(output) } }
+                    dest
+                }
+
+                pendingAudioFile.value?.takeIf { it != local }?.delete()
+                pendingAudioFile.value = local
+                pendingAudioMimeType.value = audioMimeTypeFor(
+                    displayName,
+                    context.contentResolver.getType(uri)
+                )
+                _uploadedFileName.value = displayName
+
+                val seconds = withContext(Dispatchers.IO) { probeAudioDurationSeconds(local) }
+                if (seconds != null) _recordingDuration.value = seconds
+
+                if (lectureTitle.value.isEmpty()) {
+                    lectureTitle.value = deriveTitleFromFileName(displayName)
+                }
+                _uiMessage.value = "Audio imported. Tap Transcribe Audio with AI."
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to import audio", e)
+                _uiMessage.value = "Could not import audio: ${e.localizedMessage ?: "unknown error"}"
+            }
         }
     }
 
     fun clearUploadedAudio() {
         _uploadedFileName.value = null
+        pendingAudioMimeType.value = null
+        pendingAudioFile.value?.delete()
+        pendingAudioFile.value = null
     }
 
+    /** Transcribes the previously imported audio file via Gemini. */
     fun transcribeUploadedAudio() {
-        val fileName = _uploadedFileName.value ?: return
+        val file = pendingAudioFile.value
+        if (file == null || !file.exists()) {
+            _uiMessage.value = "Please choose an audio file first."
+            return
+        }
+        transcribeAudioFile(file, pendingAudioMimeType.value ?: "audio/mp3")
+    }
+
+    /**
+     * Shared transcription pipeline for recorded and imported audio:
+     * reads the bytes, sends them to Gemini, and fills the transcript field.
+     */
+    private fun transcribeAudioFile(file: File, mimeType: String) {
         _isTranscribing.value = true
-        _uiMessage.value = "Transcribing uploaded audio file..."
-        
+        _uiMessage.value = "Transcribing audio with Gemini..."
         viewModelScope.launch {
-            delay(3000)
+            val result = try {
+                val bytes = withContext(Dispatchers.IO) { file.readBytes() }
+                GeminiClient.transcribeAudio(mimeType = mimeType, audioBytes = bytes)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to read audio for transcription", e)
+                TranscriptionResult.Error(
+                    "Could not read the audio file: ${e.localizedMessage ?: "unknown error"}"
+                )
+            }
             _isTranscribing.value = false
-            
-            val query = fileName.lowercase()
-            transcriptInput.value = when {
-                query.contains("neural") || query.contains("ai") || query.contains("deep") -> {
-                    "Good morning class. Today we are exploring Artificial Neural Networks. Specifically, we will discuss how nodes, weights, and bias functions model human brain activity. A neuron receives numerical inputs, multiplies them by their corresponding connection weights, and sums them up. This sum is passed through an activation function, such as Sigmoid, ReLU, or Softmax. The activation function introduces non-linearity, which is critical because without it, the neural network would just behave like a single linear regression model, regardless of depth."
+            when (result) {
+                is TranscriptionResult.Success -> {
+                    transcriptInput.value = result.text
+                    _uiMessage.value = "Transcription complete! Review it below, then tap Summarize."
                 }
-                query.contains("eco") || query.contains("finance") || query.contains("market") -> {
-                    "Welcome back. In today's Macroeconomics session, we investigate the Law of Supply and Demand. At the equilibrium price, the quantity demanded by consumers exactly matches the quantity supplied by producers. If supply drops due to a resource shock, the supply curve shifts leftward, causing a market shortage, which pushes prices upward. Price elasticity of demand measures how responsive buyers are to price changes. Highly elastic products see sharp demand drops with small price hikes."
-                }
-                query.contains("rome") || query.contains("history") || query.contains("empire") -> {
-                    "Today we cover the Fall of the Roman Empire. Academic historians generally point to a combination of military decay, economic hyperinflation, political corruption, and pressure from barbarian migrations such as the Goths and Vandals around 476 CE. Emperor Diocletian partitioned the empire into the Western and Eastern sectors, which created administrative separation and ultimately accelerated the collapse of Rome."
-                }
-                else -> {
-                    "Welcome class. Today we are initiating a deep review of our core subject. We will cover the primary methodology, review key formulas, and explore real-world case study implementations. Let's make sure we document the core theories, take note of relevant equations, and prepare ourselves for active retrieval and recall exercises."
+                is TranscriptionResult.Error -> {
+                    _uiMessage.value = result.message
                 }
             }
-            _uiMessage.value = "Audio transcription complete! Tap Generate Summary."
         }
+    }
+
+    /** Reads the media duration; returns null if the container can't be probed. */
+    private fun probeAudioDurationSeconds(file: File): Int? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(file.absolutePath)
+            val ms = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull()
+            ms?.takeIf { it > 0 }?.let { (it / 1000).toInt() }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not probe audio duration for ${file.name}", e)
+            null
+        } finally {
+            retriever.release()
+        }
+    }
+
+    private fun deriveTitleFromFileName(fileName: String): String {
+        return fileName.substringAfterLast('/')
+            .substringBeforeLast(".")
+            .replace("_", " ")
+            .replace("-", " ")
+            .split(" ")
+            .filter { it.isNotBlank() }
+            .joinToString(" ") { it.replaceFirstChar { c -> c.uppercase() } }
     }
 
     // Factory Class

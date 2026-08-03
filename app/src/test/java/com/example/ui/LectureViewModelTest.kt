@@ -1,11 +1,13 @@
 package com.example.ui
 
 import android.app.Application
+import android.net.Uri
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.BuildConfig
 import com.example.MainDispatcherRule
 import com.example.data.AppDatabase
+import com.example.data.AudioRecorderController
 import com.example.data.FlashcardJson
 import com.example.data.Lecture
 import com.example.data.LectureRepository
@@ -27,6 +29,33 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.io.File
+
+/** Test double for microphone capture — no audio hardware involved. */
+class FakeAudioRecorderController : AudioRecorderController {
+
+  var started = false
+  var stopped = false
+  var cancelled = false
+  var failOnStartWith: String? = null
+  var failOnStop = false
+
+  override fun start(outputFile: File) {
+    failOnStartWith?.let { throw java.io.IOException(it) }
+    started = true
+    // Non-empty file so stopRecording() treats it as a valid capture.
+    outputFile.writeBytes(ByteArray(64) { it.toByte() })
+  }
+
+  override fun stop() {
+    if (failOnStop) throw RuntimeException("no frames captured")
+    stopped = true
+  }
+
+  override fun cancel() {
+    cancelled = true
+  }
+}
 
 /**
  * Drives [LectureViewModel] with a real in-memory Room database. Coroutines
@@ -45,6 +74,7 @@ class LectureViewModelTest {
   private lateinit var db: AppDatabase
   private lateinit var repository: LectureRepository
   private lateinit var viewModel: LectureViewModel
+  private lateinit var fakeRecorder: FakeAudioRecorderController
 
   private val apiKeyIsPlaceholder: Boolean
     get() = BuildConfig.GEMINI_API_KEY.isBlank() ||
@@ -62,7 +92,8 @@ class LectureViewModelTest {
       flashcardDao = db.flashcardDao(),
       studySlotDao = db.studySlotDao()
     )
-    viewModel = LectureViewModel(app, repository)
+    fakeRecorder = FakeAudioRecorderController()
+    viewModel = LectureViewModel(app, repository) { fakeRecorder }
   }
 
   @After
@@ -119,8 +150,16 @@ class LectureViewModelTest {
     assertEquals(2, viewModel.activeFlashcards.filter { it.isNotEmpty() }.first().size)
   }
 
+  /** Creates a small fake audio file behind a file:// Uri for import tests. */
+  private fun stageAudioFile(name: String = "source_sample.mp3"): Uri {
+    val app = ApplicationProvider.getApplicationContext<Application>()
+    val file = File(app.cacheDir, "test_stage_$name")
+    file.writeBytes(ByteArray(256) { (it % 7).toByte() })
+    return Uri.fromFile(file)
+  }
+
   @Test
-  fun `navigating away from a recording stops it`() = runTest {
+  fun `navigating away from a recording stops and discards it`() = runTest {
     viewModel.navigateTo(ScreenState.RecordNew)
     viewModel.startRecording()
     assertTrue(viewModel.isRecording.value)
@@ -128,6 +167,8 @@ class LectureViewModelTest {
     viewModel.navigateTo(ScreenState.Dashboard)
 
     assertFalse(viewModel.isRecording.value)
+    assertTrue("the capture must be cancelled", fakeRecorder.cancelled)
+    assertFalse("no transcription should kick off", viewModel.isTranscribing.value)
   }
 
   // --- Analyze & save: validation ---
@@ -303,10 +344,11 @@ class LectureViewModelTest {
     viewModel.subjects.first { list -> list.none { it.name == "Astrophysics" } }
   }
 
-  // --- Recording simulation & uploads (flag-level behavior only) ---
+  // --- Microphone recording & audio import (with fake recorder) ---
 
   @Test
-  fun `startRecording sets flags and stopRecording clears them`() = runTest {
+  fun `startRecording captures and stopRecording kicks off transcription`() = runTest {
+    assumeTrue("requires the placeholder API key", apiKeyIsPlaceholder)
     viewModel.transcriptInput.value = "stale text"
 
     viewModel.startRecording()
@@ -314,44 +356,104 @@ class LectureViewModelTest {
     assertTrue(viewModel.isRecording.value)
     assertEquals(0, viewModel.recordingDuration.value)
     assertEquals("", viewModel.transcriptInput.value)
+    assertTrue(fakeRecorder.started)
 
     viewModel.startRecording() // second call is a no-op while recording
     assertTrue(viewModel.isRecording.value)
 
     viewModel.stopRecording()
+
     assertFalse(viewModel.isRecording.value)
+    assertTrue(fakeRecorder.stopped)
+    // In demo mode the attempted transcription ends in an actionable message.
+    viewModel.uiMessage.filterNotNull().first { it.contains("API key") }
+    assertFalse(viewModel.isTranscribing.value)
   }
 
   @Test
-  fun `setUploadedAudio builds a friendly title from the file name`() = runTest {
-    viewModel.setUploadedAudio("neural_networks-final.mp3")
+  fun `startRecording surfaces microphone failures`() = runTest {
+    fakeRecorder.failOnStartWith = "mic busy"
 
+    viewModel.startRecording()
+
+    assertFalse(viewModel.isRecording.value)
+    assertFalse(fakeRecorder.started)
+    assertEquals("Could not start microphone: mic busy", viewModel.uiMessage.value)
+  }
+
+  @Test
+  fun `stopping a too short recording discards the audio`() = runTest {
+    fakeRecorder.failOnStop = true
+
+    viewModel.startRecording()
+    viewModel.stopRecording()
+
+    assertEquals(
+      "Recording was too short — no audio was captured.",
+      viewModel.uiMessage.value
+    )
+    assertFalse(viewModel.isTranscribing.value)
+  }
+
+  @Test
+  fun `permission denial explains fallback options`() = runTest {
+    viewModel.onMicPermissionDenied()
+
+    val message = viewModel.uiMessage.value
+    assertNotNull(message)
+    assertTrue(message!!.contains("Microphone permission"))
+    assertTrue(message.contains("import an audio file"))
+  }
+
+  @Test
+  fun `importAudio builds a friendly title and stages the file`() = runTest {
+    viewModel.importAudio(stageAudioFile(), "neural_networks-final.mp3")
+
+    viewModel.uiMessage.filterNotNull().first { it.startsWith("Audio imported") }
     assertEquals("neural_networks-final.mp3", viewModel.uploadedFileName.value)
     assertEquals("Neural Networks Final", viewModel.lectureTitle.value)
-    assertTrue(viewModel.recordingDuration.value in 180..360)
   }
 
   @Test
-  fun `setUploadedAudio never overwrites a title the user typed`() = runTest {
+  fun `importAudio never overwrites a title the user typed`() = runTest {
     viewModel.lectureTitle.value = "Keep This Title"
 
-    viewModel.setUploadedAudio("some_audio.mp3")
+    viewModel.importAudio(stageAudioFile(), "some_audio.mp3")
 
+    viewModel.uiMessage.filterNotNull().first { it.startsWith("Audio imported") }
     assertEquals("Keep This Title", viewModel.lectureTitle.value)
   }
 
   @Test
-  fun `transcribeUploadedAudio reports progress and clearUploadedAudio resets`() = runTest {
-    viewModel.setUploadedAudio("lecture.mp3")
+  fun `transcribeUploadedAudio without an import warns the user`() = runTest {
+    viewModel.transcribeUploadedAudio()
+
+    assertEquals("Please choose an audio file first.", viewModel.uiMessage.value)
+  }
+
+  @Test
+  fun `transcribeUploadedAudio transcribes the staged file through Gemini`() = runTest {
+    assumeTrue("requires the placeholder API key", apiKeyIsPlaceholder)
+    viewModel.importAudio(stageAudioFile(), "week4_lecture.mp3")
+    viewModel.uiMessage.filterNotNull().first { it.startsWith("Audio imported") }
 
     viewModel.transcribeUploadedAudio()
 
-    // The simulated pipeline pauses on a delay; while paused it reports progress.
-    assertTrue(viewModel.isTranscribing.value)
-    assertEquals("Transcribing uploaded audio file...", viewModel.uiMessage.value)
+    // The staged local copy is what gets sent — demo mode reports the key error.
+    viewModel.uiMessage.filterNotNull().first { it.contains("API key") }
+    assertFalse(viewModel.isTranscribing.value)
+  }
+
+  @Test
+  fun `clearUploadedAudio discards the staged import`() = runTest {
+    viewModel.importAudio(stageAudioFile(), "lecture.mp3")
+    viewModel.uiMessage.filterNotNull().first { it.startsWith("Audio imported") }
 
     viewModel.clearUploadedAudio()
+
     assertNull(viewModel.uploadedFileName.value)
+    viewModel.transcribeUploadedAudio()
+    assertEquals("Please choose an audio file first.", viewModel.uiMessage.value)
   }
 
   // --- Focus timer ---

@@ -235,4 +235,24 @@ class GeminiJsonParsingTest {
     assertTrue(!json.contains("generationConfig"))
     assertTrue(!json.contains("systemInstruction"))
   }
+
+  @Test
+  fun `audio part serializes as inline_data with snake case keys`() {
+    // The Gemini API expects inline audio as {"inline_data": {"mime_type", "data"}}.
+    val request = GenerateContentRequest(
+      contents = listOf(
+        Content(
+          parts = listOf(
+            Part(text = "Transcribe this lecture"),
+            Part(inlineData = InlineData(mimeType = "audio/mp4", data = "QUJD"))
+          )
+        )
+      )
+    )
+
+    val json = moshi.adapter(GenerateContentRequest::class.java).toJson(request)
+
+    assertTrue(json.contains("\"text\":\"Transcribe this lecture\""))
+    assertTrue(json.contains("\"inline_data\":{\"mime_type\":\"audio/mp4\",\"data\":\"QUJD\"}"))
+  }
 }

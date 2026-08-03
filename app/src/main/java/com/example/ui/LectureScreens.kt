@@ -52,6 +52,9 @@ import com.example.data.QuizQuestion
 import com.example.data.StudySlot
 import java.text.SimpleDateFormat
 import java.util.*
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -881,6 +884,15 @@ fun RecordNewScreen(viewModel: LectureViewModel) {
     val titleInput by viewModel.lectureTitle.collectAsState()
     val transcriptInput by viewModel.transcriptInput.collectAsState()
 
+    val context = LocalContext.current
+
+    // Microphone runtime permission gate for real audio capture
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) viewModel.startRecording() else viewModel.onMicPermissionDenied()
+    }
+
     // Recording pulsation wave animations
     val infiniteTransition = rememberInfiniteTransition(label = "Waves")
     val waveScale by infiniteTransition.animateFloat(
@@ -1000,7 +1012,7 @@ fun RecordNewScreen(viewModel: LectureViewModel) {
                     )
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // Simulated Microphone Wave Panel
+                    // Live Microphone Capture Panel
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1036,13 +1048,13 @@ fun RecordNewScreen(viewModel: LectureViewModel) {
                                 Spacer(modifier = Modifier.width(10.dp))
                                 Column {
                                     Text(
-                                        text = if (isRecording) "Listening & Transcribing..." else "Simulate Live Lecture",
+                                        text = if (isRecording) "Recording microphone..." else "Record Live Lecture",
                                         color = PolishTextPrimary,
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 12.sp
                                     )
                                     Text(
-                                        text = if (isRecording) "Real-time stream active: ${formatDuration(recordingDuration)}" else "Auto-capture classroom audio",
+                                        text = if (isRecording) "Capturing: ${formatDuration(recordingDuration)} — Stop to transcribe" else "Real mic capture, transcribed by Gemini",
                                         color = PolishTextMuted,
                                         fontSize = 10.sp
                                     )
@@ -1051,7 +1063,13 @@ fun RecordNewScreen(viewModel: LectureViewModel) {
 
                             Button(
                                 onClick = {
-                                    if (isRecording) viewModel.stopRecording() else viewModel.startRecording()
+                                    if (isRecording) {
+                                        viewModel.stopRecording()
+                                    } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                                        viewModel.startRecording()
+                                    } else {
+                                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
                                 },
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = if (isRecording) PolishVibrantCoral else PolishPrimary
@@ -1059,7 +1077,7 @@ fun RecordNewScreen(viewModel: LectureViewModel) {
                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                                 modifier = Modifier
                                     .height(32.dp)
-                                    .testTag("record_sim_button")
+                                    .testTag("record_mic_button")
                             ) {
                                 Text(
                                     text = if (isRecording) "Stop" else "Record",
@@ -1074,7 +1092,6 @@ fun RecordNewScreen(viewModel: LectureViewModel) {
                     Spacer(modifier = Modifier.height(12.dp))
 
                     // Direct Audio Upload & AI Transcription Section
-                    val context = LocalContext.current
                     val uploadedFileName by viewModel.uploadedFileName.collectAsState()
                     val isTranscribing by viewModel.isTranscribing.collectAsState()
 
@@ -1083,7 +1100,7 @@ fun RecordNewScreen(viewModel: LectureViewModel) {
                     ) { uri: Uri? ->
                         if (uri != null) {
                             val name = getFileNameFromUri(context, uri) ?: "lecture_audio_import.mp3"
-                            viewModel.setUploadedAudio(name)
+                            viewModel.importAudio(uri, name)
                         }
                     }
 
@@ -1158,7 +1175,7 @@ fun RecordNewScreen(viewModel: LectureViewModel) {
                                                     overflow = TextOverflow.Ellipsis
                                                 )
                                                 Text(
-                                                    text = "Audio loaded successfully",
+                                                    text = "Imported — ready to transcribe",
                                                     color = PolishPrimary,
                                                     fontSize = 10.sp,
                                                     fontWeight = FontWeight.SemiBold
