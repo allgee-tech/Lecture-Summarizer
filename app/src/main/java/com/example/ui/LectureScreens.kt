@@ -2394,8 +2394,8 @@ fun RenderMarkdown(text: String) {
 
 /**
  * Handles basic **bolding** inside strings.
+ * (Not a composable — it only builds an AnnotatedString, which keeps it unit-testable.)
  */
-@Composable
 fun parseBoldMarkdown(input: String): androidx.compose.ui.text.AnnotatedString {
     return androidx.compose.ui.text.buildAnnotatedString {
         val parts = input.split("**")
